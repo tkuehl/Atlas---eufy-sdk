@@ -256,15 +256,62 @@ class ClipError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
-async function downloadClip(stationSn, path, channel) {
+/**
+ * One recording over P2P, decrypted. With `sink`, each frame is handed over AS IT ARRIVES (analyze-during-download,
+ * 2026-11-09) once the station's current key code is shown to open the first encrypted frame; a clip recorded before
+ * the code changed cannot stream (the right code is only found by trying the remembered ones on that frame) and is
+ * handed over whole at the end instead. Without `sink`, the whole stream is returned in `body`.
+ * `sink(null)` is never called; the caller ends its output when this resolves, and aborts it when this throws.
+ */
+async function downloadClip(stationSn, path, channel, sink = null) {
   return withStation(stationSn, async () => {
     const s = await session(stationSn);
     const did = p2pDidOf(stationSn);
     const t0 = Date.now();
-    // Frames are kept raw and decrypted once the download ends: the key code's reply can arrive after the first
-    // video frames (seen 2026-11-09: a whole clip came back with its first keyframe still encrypted).
-    const raws = [];
-    let code, frames = 0, decrypted = 0, undecryptable = 0, last = Date.now(), finished = false, refused;
+    // The key code's reply can arrive after the first video frames (seen 2026-11-09), so frames wait in `pending`
+    // until a key is settled.
+    const pending = [];
+    const kept = [];   // whole-clip mode: every raw frame, decrypted at the end
+    let code, frames = 0, decrypted = 0, undecryptable = 0, emitted = 0, last = Date.now(), finished = false, refused;
+    let streamKey = null, streamBroken = !sink, firstFrameMs = null;
+    const encrypted = (r) => (r.signed || !isStart(r.raw, 22)) && r.raw.length >= 150;
+    const keyFor = (c) => Buffer.from(imageKey(stationSn, did, c).slice(0, 16), "utf8");
+    const opens = (c, r) => {
+      const dc = crypto.createDecipheriv("aes-128-ecb", keyFor(c), null);
+      dc.setAutoPadding(false);
+      return isStart(Buffer.concat([dc.update(r.raw.subarray(22, 150)), dc.final()]), 0);
+    };
+    const plain = (r, key) => {
+      const { raw } = r;
+      if (r.done) { /* already decrypted in place (streamed before the stream broke) */ }
+      else if (encrypted(r)) {
+        const dc = crypto.createDecipheriv("aes-128-ecb", key, null);
+        dc.setAutoPadding(false);
+        Buffer.concat([dc.update(raw.subarray(22, 150)), dc.final()]).copy(raw, 22);
+        decrypted++;
+      } else if (r.signed) {
+        undecryptable++;
+      }
+      r.done = true;
+      const declared = raw.readUInt32LE(0);
+      return raw.subarray(22, declared > 0 && 22 + declared <= raw.length ? 22 + declared : raw.length);
+    };
+    const pump = () => {
+      if (streamBroken || !code) return;
+      while (pending.length) {
+        const r = pending[0];
+        if (!streamKey) {
+          if (!encrypted(r)) { /* plain lead-in: fine to pass through */ }
+          else if (opens(code, r)) streamKey = keyFor(code);
+          else { streamBroken = true; log(`[clip] ${stationSn} ${path}: current key code does not open it - not streaming`); return; }
+        }
+        pending.shift();
+        const out = plain(r, streamKey ?? keyFor(code));
+        if (!emitted && !isStart(out, 0)) { streamBroken = true; pending.unshift(r); return; }
+        sink(out);
+        emitted++;
+      }
+    };
     const onData = (f) => {
       const cmd = f.commandId;
       if (cmd === 1024) {
@@ -273,7 +320,8 @@ async function downloadClip(stationSn, path, channel) {
         const rc = d.length >= 4 ? d.readInt32LE(0) : -1;
         if (rc !== 0) { refused = rc; return; }
         code = d.subarray(4).toString("latin1").split("\0")[0];
-        log(`[clip] ${stationSn} key reply len=${d.length} after ${frames} frames, code ${code.length} chars, head ${d.subarray(0, 20).toString("hex")}`);
+        rememberCode(stationSn, code);
+        pump();
         return;
       }
       if (cmd === 1304) { finished = true; return; }
@@ -282,7 +330,10 @@ async function downloadClip(stationSn, path, channel) {
       const raw = Buffer.from(f.raw);
       if (raw.length < 22) return;
       frames++;
-      raws.push({ raw, signed: f.signCode > 0 });
+      if (firstFrameMs === null) firstFrameMs = Date.now() - t0;
+      const r = { raw, signed: f.signCode > 0 };
+      kept.push(r);
+      if (!streamBroken) { pending.push(r); pump(); }
     };
     const onResult = (r) => { if (r?.code !== undefined && r.code !== 0 && !code) refused = r.code; };
     s.on("data", onData);
@@ -290,61 +341,46 @@ async function downloadClip(stationSn, path, channel) {
     try {
       s.sendStringPairCommand(1024, path, accountIdOf(stationSn), channel);
       while (!finished) {
-        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setTimeout(r, 100));
         if (refused !== undefined) throw new ClipError(404, `camera refused ${path}: result ${refused}`);
         if (!frames && Date.now() - t0 > 12_000) throw new ClipError(502, `no data within 12s (code ${code ? "received" : "missing"})`);
         if (frames && Date.now() - last > 15_000) throw new ClipError(502, `stalled after ${frames} frames`);
-        if (Date.now() - t0 > 180_000) throw new ClipError(502, `still running after 180s (${frames} frames)`);
+        if (Date.now() - t0 > 240_000) throw new ClipError(502, `still running after 240s (${frames} frames)`);
       }
     } finally {
       s.off("data", onData);
       s.off("commandResult", onResult);
     }
     if (!code) throw new ClipError(502, `download finished but no key code arrived (${frames} frames)`);
-    if (process.env.DUMP_DIR) {
-      // Debug: the raw transfer in the probe's length-prefixed format (u32 cmd, u32 len, raw).
-      const parts = raws.flatMap(({ raw }) => { const h = Buffer.alloc(8); h.writeUInt32LE(1300, 0); h.writeUInt32LE(raw.length, 4); return [h, Buffer.from(raw)]; });
-      fs.writeFileSync(`${process.env.DUMP_DIR}/dump-${stationSn}-${code}.bin`, Buffer.concat(parts));
+    const seconds = (Date.now() - t0) / 1000;
+    const stats = { frames, firstFrameMs, seconds };
+
+    if (sink && !streamBroken) {
+      pump();
+      if (pending.length) throw new ClipError(502, `stream left ${pending.length} frames unsent`);
+      state.downloads++;
+      log(`[clip] ${stationSn} ${path}: streamed ${frames} frames (${decrypted} decrypted), first frame ${firstFrameMs} ms, ${seconds.toFixed(1)}s`);
+      return { ...stats, decrypted, undecryptable, streamed: true };
     }
-    // The reply carries the station's CURRENT key code; a clip recorded before the code changed needs the code
-    // that was current then (2026-11-09: last night's clip refused today's code and opened with yesterday's).
-    // So every code seen is remembered, and the first encrypted frame picks the one that opens it.
-    const encrypted = (r) => (r.signed || !isStart(r.raw, 22)) && r.raw.length >= 150;
-    const probe = raws.find(encrypted);
-    const keyFor = (c) => Buffer.from(imageKey(stationSn, did, c).slice(0, 16), "utf8");
-    const opens = (c) => {
-      const dc = crypto.createDecipheriv("aes-128-ecb", keyFor(c), null);
-      dc.setAutoPadding(false);
-      return isStart(Buffer.concat([dc.update(probe.raw.subarray(22, 150)), dc.final()]), 0);
-    };
-    rememberCode(stationSn, code);
-    const usedCode = !probe ? code : [code, ...knownCodes(stationSn).filter((c) => c !== code)].find(opens);
+    if (sink && emitted) throw new ClipError(502, `stream broke after ${emitted} frames`);   // never sent half a clip
+
+    // Whole clip: the first encrypted frame picks the remembered code that opens it.
+    const probe = kept.find(encrypted);
+    const usedCode = !probe ? code : [code, ...knownCodes(stationSn).filter((c) => c !== code)].find((c) => opens(c, probe));
     if (!usedCode) {
       throw new ClipError(502, `no known key code opens ${path} (${knownCodes(stationSn).length} tried; current ${code}) frames=${frames}`);
     }
     if (usedCode !== code) log(`[clip] ${stationSn} ${path}: opened with an earlier key code (current one did not)`);
     const key = keyFor(usedCode);
-    const out = [];
-    for (const r of raws) {
-      const { raw } = r;
-      if (encrypted(r)) {
-        const dc = crypto.createDecipheriv("aes-128-ecb", key, null);
-        dc.setAutoPadding(false);
-        Buffer.concat([dc.update(raw.subarray(22, 150)), dc.final()]).copy(raw, 22);
-        decrypted++;
-      } else if (r.signed) {
-        undecryptable++;
-      }
-      const declared = raw.readUInt32LE(0);
-      out.push(raw.subarray(22, declared > 0 && 22 + declared <= raw.length ? 22 + declared : raw.length));
-    }
-    const body = Buffer.concat(out);
+    decrypted = 0; undecryptable = 0;
+    const body = Buffer.concat(kept.map((r) => plain(r, key)));
     if (!isStart(body, 0)) {
-      throw new ClipError(502, `stream does not start with a NAL start code frames=${frames} decrypted=${decrypted} head=${raws[0]?.raw.subarray(0, 30).toString("hex")}`);
+      throw new ClipError(502, `stream does not start with a NAL start code frames=${frames} decrypted=${decrypted} head=${kept[0]?.raw.subarray(0, 30).toString("hex")}`);
     }
+    if (sink) sink(body);
     state.downloads++;
-    log(`[clip] ${stationSn} ${path}: ${frames} frames, ${decrypted} decrypted, ${(body.length / 1048576).toFixed(1)} MB in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-    return { body, frames, decrypted, undecryptable, seconds: (Date.now() - t0) / 1000 };
+    log(`[clip] ${stationSn} ${path}: ${frames} frames, ${decrypted} decrypted, ${(body.length / 1048576).toFixed(1)} MB in ${seconds.toFixed(1)}s`);
+    return { ...stats, body, decrypted, undecryptable, streamed: false };
   });
 }
 
@@ -482,16 +518,34 @@ http.createServer(async (req, res) => {
       const station = url.searchParams.get("station"), path = url.searchParams.get("path");
       if (!station || !path) return send(res, 400, { error: "station and path are required" });
       const channel = Number(url.searchParams.get("channel") ?? "0");
+      // stream=1: chunked, each frame written as it arrives (headers on the first one). A failure after that ABORTS
+      // the response, so a client can never mistake a cut stream for a whole clip.
+      const stream = url.searchParams.get("stream") === "1";
+      let started = false;
+      const sink = !stream ? null : (buf) => {
+        if (!started) { res.writeHead(200, { "content-type": "application/octet-stream", "x-stream": "1" }); started = true; }
+        res.write(buf);
+      };
       // -111 also came back once for a clip that exists, straight after another download: one retry 4 s later.
       let r;
-      try { r = await downloadClip(station, path, channel); } catch (e) {
-        if (!(e instanceof ClipError) || e.status !== 404) throw e;
-        await new Promise((ok) => setTimeout(ok, 4000));
-        r = await downloadClip(station, path, channel);
+      try {
+        try { r = await downloadClip(station, path, channel, sink); } catch (e) {
+          if (!(e instanceof ClipError) || e.status !== 404 || started) throw e;
+          await new Promise((ok) => setTimeout(ok, 4000));
+          r = await downloadClip(station, path, channel, sink);
+        }
+      } catch (e) {
+        if (started) { log(`[http] ${url.pathname}${url.search} aborted mid-stream: ${e.message}`); res.destroy(e); return; }
+        throw e;
+      }
+      if (stream) {
+        if (!started) res.writeHead(200, { "content-type": "application/octet-stream", "x-stream": "1" });
+        return res.end();
       }
       res.writeHead(200, {
         "content-type": "application/octet-stream", "content-length": r.body.length,
         "x-frames": r.frames, "x-decrypted": r.decrypted, "x-undecryptable": r.undecryptable, "x-seconds": r.seconds.toFixed(1),
+        "x-first-frame-ms": r.firstFrameMs,
       });
       return res.end(r.body);
     }
