@@ -170,7 +170,7 @@ async function withStation(stationSn, fn) {
   await prev;
   try {
     try { return await fn(); } catch (e) {
-      if (e instanceof ClipError && e.status === 404) throw e;
+      if ((e instanceof ClipError && e.status === 404) || !deviceBySn(stationSn)) throw e;
       log(`[p2p] ${stationSn}: ${e.message} — reconnecting and retrying once`);
       await resetStation(stationSn);
       return await fn();
@@ -178,8 +178,12 @@ async function withStation(stationSn, fn) {
   } finally { release(); }
 }
 
+// Closing the session makes the SDK's session manager drop it (its `close` handler), so the next connectStation()
+// opens a fresh one. (The manager itself is private to the SDK's command router.)
 async function resetStation(stationSn) {
-  try { await eufy.p2p.close(stationSn); } catch (e) { log(`[p2p] ${stationSn}: close failed: ${e.message}`); }
+  const s = eufy.getP2pSessions().get(stationSn);
+  if (!s) return;
+  try { await s.close(); } catch (e) { log(`[p2p] ${stationSn}: close failed: ${e.message}`); }
 }
 
 /** `reads`: database / image reads, which a CLEAR_READS station only answers in the clear. Everything else
