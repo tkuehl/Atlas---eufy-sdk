@@ -107,6 +107,23 @@ function rememberImage(id, promise) {
   while (images.size > 200) images.delete(images.keys().next().value);
 }
 
+/** The push thumbnail. The first attempt, ~0.4 s after the push, failed with an HTTP status on the first live event
+ *  (2026-11-09): the picture is likely not uploaded yet. Retries over ~15 s. */
+async function fetchThumbnail(id, url, did) {
+  const delays = [0, 2000, 4000, 8000];
+  for (let i = 0; i < delays.length; i++) {
+    if (delays[i]) await new Promise((r) => setTimeout(r, delays[i]));
+    try {
+      const buf = await eufy.mega.downloadImage(url, did);
+      if (i > 0) log(`[image] ${id} fetched on attempt ${i + 1}`);
+      return buf;
+    } catch (e) {
+      log(`[image] ${id} attempt ${i + 1} failed: ${e.message}${e.mediaFailure ? ` (${e.mediaFailure}${e.status ? ` ${e.status}` : ""})` : ""}`);
+    }
+  }
+  return undefined;
+}
+
 function onEvent(ev) {
   const name = ev?.eventName;
   const sensors = SENSORS[name];
@@ -119,10 +136,7 @@ function onEvent(ev) {
   const id = crypto.randomUUID();
   const picUrl = ev.pic_url || ev.thumbnailUrl;
   if (picUrl) {
-    rememberImage(id, eufy.mega.downloadImage(picUrl, p2pDidOf(ev.stationSn || ev.deviceSn)).catch((e) => {
-      log(`[image] ${id} download failed: ${e.message}`);
-      return undefined;
-    }));
+    rememberImage(id, fetchThumbnail(id, picUrl, p2pDidOf(ev.stationSn || ev.deviceSn)));
   }
   const attributes = {
     source: "eufy-bridge", event: name, event_type: ev.event_type ?? ev.eventType, device_sn: ev.deviceSn,
@@ -145,20 +159,40 @@ function onEvent(ev) {
 
 // ── P2P helpers ──────────────────────────────────────────────────────────────────────────────────────────
 const stationLocks = new Map();
+/** One P2P job per station at a time. A job that fails for any reason but "no such file" drops the station's
+ *  session and runs once more on a fresh one: after the garage camera rebooted (2026-11-09) its old session kept
+ *  "working" and every read came back empty until the session was replaced. */
 async function withStation(stationSn, fn) {
   const prev = stationLocks.get(stationSn) ?? Promise.resolve();
   let release;
   const mine = new Promise((r) => (release = r));
   stationLocks.set(stationSn, prev.then(() => mine));
   await prev;
-  try { return await fn(); } finally { release(); }
+  try {
+    try { return await fn(); } catch (e) {
+      if (e instanceof ClipError && e.status === 404) throw e;
+      log(`[p2p] ${stationSn}: ${e.message} — reconnecting and retrying once`);
+      await resetStation(stationSn);
+      return await fn();
+    }
+  } finally { release(); }
+}
+
+async function resetStation(stationSn) {
+  try { await eufy.p2p.close(stationSn); } catch (e) { log(`[p2p] ${stationSn}: close failed: ${e.message}`); }
 }
 
 /** `reads`: database / image reads, which a CLEAR_READS station only answers in the clear. Everything else
  *  (the clip download) keeps the SDK's own choice — forced clear, the garage refuses a download (-111). */
 async function session(stationSn, { reads = false } = {}) {
   await eufy.connectStation(stationSn);
-  const s = eufy.getP2pSessions().get(stationSn);
+  let s = eufy.getP2pSessions().get(stationSn);
+  if (s && (!s.isConnected || !s.pathAnswering)) {
+    log(`[p2p] ${stationSn}: session ${s.isConnected ? "silent" : "closed"} — reconnecting`);
+    await resetStation(stationSn);
+    await eufy.connectStation(stationSn);
+    s = eufy.getP2pSessions().get(stationSn);
+  }
   if (!s) throw new Error(`no P2P session for ${stationSn}`);
   // Let the level-2 negotiation settle (or give up) before sending: the chime negotiates cipher 62.
   try { await s.awaitLevel2Key(9000, "session"); } catch { /* no key is a normal answer */ }
@@ -372,6 +406,7 @@ async function latestInfo(stationSn) {
     } finally {
       s.off("dbChunk", on);
     }
+    if (!text.includes("{")) throw new Error("no latest-info reply from the station");
     const json = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
     const parsed = JSON.parse(json);
     const data = typeof parsed.data === "string" ? JSON.parse(parsed.data) : parsed.data;
@@ -406,6 +441,7 @@ async function history(stationSn, days) {
     } finally {
       s.off("dbChunk", on);
     }
+    if (!text) throw new Error("no history reply from the station");
     const rows = [];
     for (const m of text.matchAll(/{"record_id":[^{}]*}/g)) { try { rows.push(JSON.parse(m[0])); } catch { /* split row */ } }
     return rows.map((r) => ({ start: r.start_time, end: r.end_time, frames: r.frame_num, path: r.storage_path,
@@ -435,7 +471,7 @@ http.createServer(async (req, res) => {
     if (img && req.method === "GET") {
       const p = images.get(img[1]);
       if (!p) return send(res, 404, { error: "unknown image" });
-      const buf = await Promise.race([p, new Promise((r) => setTimeout(() => r(undefined), 10_000))]);
+      const buf = await Promise.race([p, new Promise((r) => setTimeout(() => r(undefined), 20_000))]);
       return buf ? send(res, 200, buf, "image/jpeg") : send(res, 504, { error: "image not available" });
     }
     if (url.pathname === "/clip" && req.method === "GET") {
